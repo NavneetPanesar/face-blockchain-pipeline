@@ -1,0 +1,35 @@
+# Environment secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Generated pipeline results
+results_*.json
+
+# Debug output
+lens_debug.json
+
+# Generated face crops
+*_face_cropped.jpg
+*_face_cropped.jpeg
+*_face_cropped.png
+
+# Temporary files
+*.tmp
+*.temp
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

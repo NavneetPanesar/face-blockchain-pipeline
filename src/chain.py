@@ -1,157 +1,189 @@
 import hashlib
 import json
-import time
 from datetime import datetime, timezone
 
 from web3 import Web3
+from dotenv import load_dotenv
+import os
 
-# Must match the deployed SocialVerifier.sol exactly
-ABI = [
-    {
-        "inputs": [
-            {"internalType": "bytes32", "name": "dataHash",  "type": "bytes32"},
-            {"internalType": "string",  "name": "postUrl",   "type": "string"},
-            {"internalType": "uint16",  "name": "similarity","type": "uint16"},
-        ],
-        "name": "store",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function",
-    },
-    {
-        "inputs": [
-            {"internalType": "bytes32", "name": "dataHash", "type": "bytes32"},
-        ],
-        "name": "verify",
-        "outputs": [
-            {"internalType": "bool",    "name": "exists",    "type": "bool"},
-            {"internalType": "string",  "name": "postUrl",   "type": "string"},
-            {"internalType": "uint256", "name": "timestamp", "type": "uint256"},
-            {"internalType": "address", "name": "submitter", "type": "address"},
-            {"internalType": "uint16",  "name": "similarity","type": "uint16"},
-        ],
-        "stateMutability": "view",
-        "type": "function",
-    },
-]
 
-EXPLORERS = {
-    11155111: "https://sepolia.etherscan.io/tx/",
-    80002:    "https://amoy.polygonscan.com/tx/",
-}
+load_dotenv()
 
 
 class BlockchainVerifier:
-    def __init__(self, rpc_url: str, private_key: str, contract_address: str):
+    ABI = [
+        {
+            "inputs": [
+                {"internalType": "bytes32", "name": "dataHash", "type": "bytes32"},
+                {"internalType": "string", "name": "postUrl", "type": "string"},
+                {"internalType": "uint16", "name": "similarity", "type": "uint16"},
+            ],
+            "name": "store",
+            "outputs": [],
+            "stateMutability": "nonpayable",
+            "type": "function",
+        },
+        {
+            "inputs": [
+                {"internalType": "bytes32", "name": "dataHash", "type": "bytes32"}
+            ],
+            "name": "verify",
+            "outputs": [
+                {"internalType": "bool", "name": "exists", "type": "bool"},
+                {"internalType": "string", "name": "postUrl", "type": "string"},
+                {"internalType": "uint256", "name": "timestamp", "type": "uint256"},
+                {"internalType": "address", "name": "submitter", "type": "address"},
+                {"internalType": "uint16", "name": "similarity", "type": "uint16"},
+            ],
+            "stateMutability": "view",
+            "type": "function",
+        },
+    ]
+
+    def __init__(self):
+        rpc_url = os.getenv("RPC_URL")
+        private_key = os.getenv("PRIVATE_KEY")
+        contract_address = os.getenv("CONTRACT_ADDRESS")
+
+        if not rpc_url:
+            raise RuntimeError("RPC_URL is missing from .env")
+
+        if not private_key:
+            raise RuntimeError("PRIVATE_KEY is missing from .env")
+
+        if not contract_address:
+            raise RuntimeError("CONTRACT_ADDRESS is missing from .env")
+
         self.w3 = Web3(Web3.HTTPProvider(rpc_url))
+
         if not self.w3.is_connected():
-            raise ConnectionError(f"Cannot reach Ethereum node: {rpc_url}")
+            raise RuntimeError("Could not connect to the Ethereum RPC")
 
-        self.account  = self.w3.eth.account.from_key(private_key)
-        self.addr     = Web3.to_checksum_address(contract_address)
-        self.contract = self.w3.eth.contract(address=self.addr, abi=ABI)
-        self.chain_id = self.w3.eth.chain_id
-
-    def info(self) -> dict:
-        bal = self.w3.eth.get_balance(self.account.address)
-        return {
-            "chain_id": self.chain_id,
-            "address":  self.account.address,
-            "balance":  float(self.w3.from_wei(bal, "ether")),
-        }
+        self.account = self.w3.eth.account.from_key(private_key)
+        self.contract = self.w3.eth.contract(
+            address=Web3.to_checksum_address(contract_address),
+            abi=self.ABI,
+        )
 
     @staticmethod
     def compute_hash(candidate: dict, embedding: list) -> bytes:
         """
-        SHA-256 of a canonical JSON that binds:
-        - the discovered post URL
-        - a fingerprint of the original face embedding
-        - the result title and source
-        - the current unix timestamp
+        Create a deterministic SHA-256 evidence fingerprint.
 
-        This means the on-chain record proves WHICH FACE was matched
-        to WHICH POST, at WHAT TIME — tamper-evident end to end.
+        The hash binds:
+        - the discovered post URL
+        - the result title
+        - the result source
+        - a fingerprint of the face embedding
+
+        The blockchain transaction/block timestamp provides the
+        authoritative time at which the evidence was recorded.
         """
+
         face_fingerprint = hashlib.sha256(
             json.dumps(
-                [round(v, 6) for v in embedding[:32]], sort_keys=True
-            ).encode()
+                [round(v, 6) for v in embedding[:32]],
+                separators=(",", ":"),
+            ).encode("utf-8")
         ).hexdigest()
 
-        canonical = json.dumps(
-            {
-                "url":              candidate.get("url", ""),
-                "title":            candidate.get("title", ""),
-                "source":           candidate.get("source", ""),
-                "face_fingerprint": face_fingerprint,
-                "ts":               int(time.time()),
-            },
-            sort_keys=True,
-        )
-        return hashlib.sha256(canonical.encode()).digest()
+        canonical = {
+            "url": candidate.get("url", ""),
+            "title": candidate.get("title", ""),
+            "source": candidate.get("source", ""),
+            "face_fingerprint": face_fingerprint,
+        }
 
-    def store(
-        self,
-        data_hash: bytes,
-        post_url: str,
-        similarity_score: float,
-    ) -> dict:
-        """
-        Write (dataHash, postUrl, similarity) to the contract.
-        similarity_score is a float 0.0–1.0; stored as uint16 × 10000.
-        Returns tx details dict.
-        """
-        similarity_int = min(10000, max(0, int(round(similarity_score * 10000))))
+        canonical_json = json.dumps(
+            canonical,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+
+        return hashlib.sha256(
+            canonical_json.encode("utf-8")
+        ).digest()
+
+    def store(self, data_hash: bytes, post_url: str, similarity: float) -> dict:
+        similarity_uint16 = int(round(similarity * 10000))
+
+        if similarity_uint16 < 0:
+            similarity_uint16 = 0
+
+        if similarity_uint16 > 10000:
+            similarity_uint16 = 10000
 
         nonce = self.w3.eth.get_transaction_count(self.account.address)
-        try:
-            gas = self.contract.functions.store(
-                data_hash, post_url, similarity_int
-            ).estimate_gas({"from": self.account.address})
-            gas = int(gas * 1.25)
-        except Exception:
-            gas = 150_000   # safe fallback
 
         tx = self.contract.functions.store(
-            data_hash, post_url, similarity_int
+            data_hash,
+            post_url,
+            similarity_uint16,
         ).build_transaction(
             {
-                "from":     self.account.address,
-                "nonce":    nonce,
-                "gas":      gas,
-                "gasPrice": self.w3.eth.gas_price,
+                "from": self.account.address,
+                "nonce": nonce,
+                "chainId": self.w3.eth.chain_id,
             }
         )
 
-        signed  = self.w3.eth.account.sign_transaction(tx, self.account.key)
-        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+        try:
+            tx["gas"] = self.w3.eth.estimate_gas(tx)
+        except Exception:
+            tx["gas"] = 150000
 
-        base = EXPLORERS.get(self.chain_id, "")
+        latest_block = self.w3.eth.get_block("latest")
+
+        base_fee = latest_block.get("baseFeePerGas")
+
+        if base_fee is not None:
+            tx["maxPriorityFeePerGas"] = self.w3.to_wei(1, "gwei")
+            tx["maxFeePerGas"] = base_fee * 2 + self.w3.to_wei(
+                1, "gwei"
+            )
+        else:
+            tx["gasPrice"] = self.w3.eth.gas_price
+
+        signed = self.account.sign_transaction(tx)
+
+        tx_hash = self.w3.eth.send_raw_transaction(
+            signed.raw_transaction
+        )
+
+        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+
         return {
-            "tx_hash":   tx_hash.hex(),
-            "block":     receipt.blockNumber,
-            "gas_used":  receipt.gasUsed,
-            "status":    receipt.status,        # 1 = success, 0 = reverted
-            "explorer":  base + tx_hash.hex() if base else "",
+            "tx_hash": tx_hash.hex(),
+            "block": receipt.blockNumber,
+            "gas_used": receipt.gasUsed,
+            "status": receipt.status,
+            "explorer": (
+                f"https://sepolia.etherscan.io/tx/{tx_hash.hex()}"
+            ),
             "data_hash": data_hash.hex(),
         }
 
     def verify(self, data_hash: bytes) -> dict:
-        """Read the record back from the contract. Returns verification dict."""
-        exists, post_url, ts, submitter, sim_int = (
-            self.contract.functions.verify(data_hash).call()
-        )
-        ts_human = (
-            datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-            if ts > 0 else "—"
-        )
+        result = self.contract.functions.verify(
+            data_hash
+        ).call()
+
+        exists, post_url, timestamp, submitter, similarity = result
+
+        readable_time = None
+
+        if timestamp:
+            readable_time = datetime.fromtimestamp(
+                timestamp,
+                timezone.utc,
+            ).isoformat()
+
         return {
-            "exists":     exists,
-            "post_url":   post_url,
-            "timestamp":  ts,
-            "ts_human":   ts_human,
-            "submitter":  submitter,
-            "similarity": round(sim_int / 10000, 4),   # back to float
-            "data_hash":  data_hash.hex(),
+            "exists": exists,
+            "post_url": post_url,
+            "timestamp": timestamp,
+            "timestamp_utc": readable_time,
+            "submitter": submitter,
+            "similarity": similarity / 10000,
         }
